@@ -9,3 +9,4 @@ pydantic>=2.0.0
 requests>=2.31.0
 scikit-learn>=1.4.0
 passlib[bcrypt]>=1.7.4
+matplotlib
