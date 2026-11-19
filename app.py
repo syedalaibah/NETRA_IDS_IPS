@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -9,9 +10,10 @@ import matplotlib.pyplot as plt
 
 from services.auth import require_login, logout_button, is_admin, get_csrf_token, require_csrf
 from services.anomaly_ml import add_anomaly_scores
-from services.firewall import block_ip, unblock_ip, list_ids_rules
+from services.capture import LiveCapture, WINDOW_SECONDS, capture_interfaces
+from services.firewall import block_ip, firewall_status, unblock_ip, list_ids_rules
 from services.ai_explainer import explain_alert
-from utils.security import is_valid_ip, sanitize_text
+from utils.security import is_valid_ip, now_ts, sanitize_text
 from utils.safe_eval import safe_eval_bool
 
 
@@ -271,37 +273,78 @@ if "live_running" not in st.session_state:
     st.session_state.live_running = True
 
 st.sidebar.divider()
-mode = st.sidebar.selectbox("Mode", ["Simulation (Demo)", "Upload Logs (CSV)"])
+LIVE_MODE = "Live Network Capture"
+CSV_MODE = "Upload Logs (CSV)"
+mode = st.sidebar.selectbox("Mode", ["Simulation (Demo)", CSV_MODE, LIVE_MODE])
+capture = st.session_state.get("capture")
+if capture and (mode != LIVE_MODE or not is_admin()):
+    capture.stop()
+    st.session_state.pop("capture")
+    capture = None
 
-refresh = st.sidebar.slider("Auto-refresh (seconds)", 0, 10, 1)
-st.sidebar.caption("Note: Streamlit reruns on widget interaction (normal). Auto-refresh here is timer-based only.")
+refresh = st.sidebar.slider("Auto-refresh (seconds)", 1 if mode == LIVE_MODE else 0, 10, 2)
 
 # Start/Stop buttons
 st.sidebar.divider()
 st.sidebar.subheader("▶ Live Feed Control")
 
-c_run1, c_run2 = st.sidebar.columns(2)
-with c_run1:
-    if st.button("✅ Start", use_container_width=True):
-        st.session_state.live_running = True
-with c_run2:
-    if st.button("⏸ Stop", use_container_width=True):
-        st.session_state.live_running = False
+if mode == LIVE_MODE:
+    if is_admin():
+        if capture and capture.active:
+            capture.renew(auth["expires_at"] - now_ts())
+            st.sidebar.caption("Capture running" if capture.ready else "Opening adapter…")
+            st.sidebar.caption(st.session_state.get("capture_adapter_label", capture.interface))
+            if st.sidebar.button("Stop capture", use_container_width=True):
+                capture.stop()
+                st.rerun()
+        else:
+            if capture and capture.error:
+                st.sidebar.error(capture.error)
+            try:
+                adapters = capture_interfaces()
+                if adapters:
+                    adapter = st.sidebar.selectbox(
+                        "Network adapter", list(adapters),
+                        format_func=adapters.__getitem__,
+                    )
+                    if st.sidebar.button("Start capture", use_container_width=True):
+                        st.session_state.pop("live_alert_history", None)
+                        st.session_state.pop("explain_options", None)
+                        st.session_state.capture_adapter_label = adapters[adapter]
+                        st.session_state.capture = LiveCapture(adapter, auth["expires_at"] - now_ts())
+                        st.rerun()
+                else:
+                    st.sidebar.warning("No capture adapters were found.")
+            except Exception as exc:
+                st.sidebar.error(f"Could not load adapters. Check Npcap. {exc}")
+    else:
+        st.sidebar.info("An admin session is required for live capture.")
+else:
+    c_run1, c_run2 = st.sidebar.columns(2)
+    with c_run1:
+        if st.button("✅ Start", use_container_width=True):
+            st.session_state.live_running = True
+    with c_run2:
+        if st.button("⏸ Stop", use_container_width=True):
+            st.session_state.live_running = False
 
-st.sidebar.caption(f"Live Feed: **{'RUNNING' if st.session_state.live_running else 'STOPPED'}**")
+    st.sidebar.caption(f"Live Feed: **{'RUNNING' if st.session_state.live_running else 'STOPPED'}**")
 
 # CSV streaming controls
 st.sidebar.divider()
-st.sidebar.subheader("CSV Streaming")
-stream_csv = st.sidebar.checkbox("Stream CSV (Live Feed)", value=True)
-rows_per_tick = st.sidebar.slider("Rows per refresh", 1, 50, 10)
-window_size = st.sidebar.slider("Visible window (rows)", 20, 500, 120)
-loop_csv = st.sidebar.checkbox("Loop at end", value=True)
+if mode == CSV_MODE:
+    st.sidebar.subheader("CSV Streaming")
+    stream_csv = st.sidebar.checkbox("Stream CSV (Live Feed)", value=True)
+    rows_per_tick = st.sidebar.slider("Rows per refresh", 1, 50, 10)
+    window_size = st.sidebar.slider("Visible window (rows)", 20, 500, 120)
+    loop_csv = st.sidebar.checkbox("Loop at end", value=True)
+elif mode == LIVE_MODE:
+    window_size = st.sidebar.slider("Recent packets to show", 20, 500, 120)
 
 # ML controls
 st.sidebar.divider()
 st.sidebar.subheader("🤖 ML Anomaly Detection")
-enable_ml = st.sidebar.checkbox("Enable Isolation Forest", value=True)
+enable_ml = st.sidebar.checkbox("Enable Isolation Forest", value=mode != LIVE_MODE, key=f"ml_{mode}")
 contamination = st.sidebar.slider("Contamination", 0.01, 0.30, 0.08)
 
 # Rules editor
@@ -317,7 +360,7 @@ edited_rules = st.sidebar.data_editor(
 
 # thresholds
 st.sidebar.divider()
-st.sidebar.subheader("Firewall Actions")
+st.sidebar.subheader("Detection thresholds")
 thr_failed = st.sidebar.number_input("Failed logins threshold", min_value=1, value=5)
 thr_ports  = st.sidebar.number_input("Ports scanned threshold", min_value=1, value=10)
 thr_cpu    = st.sidebar.number_input("CPU % threshold", min_value=1, value=90)
@@ -464,7 +507,8 @@ if "csv_sig" not in st.session_state:
 # ----------------------------
 # Load data
 # ----------------------------
-if mode == "Upload Logs (CSV)":
+tick = st.session_state.pop("feed_tick", None) == mode
+if mode == CSV_MODE:
     up = st.file_uploader("Upload CSV logs", type=["csv"])
     st.caption("Expected columns: time, src_ip, user, failed_logins, ports_scanned, cpu_percent, traffic_mbps, file_integrity_changed")
 
@@ -472,9 +516,13 @@ if mode == "Upload Logs (CSV)":
         st.info("👆 Upload a CSV file to start.")
         st.stop()
 
-    sig = f"{up.name}-{up.size}"
+    sig = up.file_id
     if st.session_state.csv_sig != sig:
-        raw = pd.read_csv(up)
+        try:
+            raw = pd.read_csv(up)
+        except (ValueError, OSError) as exc:
+            st.error(f"Could not read CSV. {exc}")
+            st.stop()
         st.session_state.csv_df = normalize_csv_columns(raw)
         st.session_state.csv_sig = sig
 
@@ -495,7 +543,7 @@ if mode == "Upload Logs (CSV)":
         if st.button("⟲ Reset Stream", use_container_width=True):
             st.session_state.csv_pos = min(rows_per_tick, total) if total > 0 else 0
 
-    if stream_csv and st.session_state.live_running and refresh and refresh > 0:
+    if tick and stream_csv and st.session_state.live_running:
         st.session_state.csv_pos += rows_per_tick
 
     if total == 0:
@@ -513,8 +561,26 @@ if mode == "Upload Logs (CSV)":
         start = max(0, end - window_size)
         df = base_df.iloc[start:end].copy()
         st.caption(f"📡 Streaming: showing rows **{start + 1} → {end}** of **{total}**")
+elif mode == LIVE_MODE:
+    metrics, packets, total_packets, saturated = capture.snapshot(window_size) if capture else ([], [], 0, False)
+    df = pd.DataFrame(metrics, columns=["time", "src_ip", "ports_scanned", "traffic_mbps"])
+    st.subheader("Live Network Capture")
+    st.caption(f"{total_packets:,} IP packets captured. Detection uses the last {WINDOW_SECONDS} seconds of observed traffic.")
+    if saturated:
+        st.warning("Packet buffer filled within the detection window. Counts and rates may be incomplete.")
+    if packets:
+        st.dataframe(pd.DataFrame(packets), use_container_width=True, hide_index=True)
+    elif capture:
+        if capture.active:
+            st.info("Waiting for IP traffic. Open a website on this PC to check the selected adapter.")
+        else:
+            st.info("Capture is stopped. Start capture to collect IP traffic.")
+    else:
+        st.info("Select an adapter and start capture to see packet metadata.")
 else:
-    df = demo_data()
+    if tick or "demo_df" not in st.session_state:
+        st.session_state.demo_df = demo_data()
+    df = st.session_state.demo_df
 
 df = df.copy()
 
@@ -527,16 +593,24 @@ if enable_ml and not df.empty:
 # Detection -> alerts_df
 # ----------------------------
 alerts = []
-for _, row in df.iterrows():
-    for _, rule in edited_rules.iterrows():
+active_rules = edited_rules.to_dict("records")
+if mode == LIVE_MODE:
+    active_rules = [rule for rule in active_rules if rule.get("type") == "NIDS"]
+for row in df.to_dict("records"):
+    for rule in active_rules:
         if eval_rule(rule, row):
+            detail = str(rule.get("desc", ""))
+            if mode == LIVE_MODE and rule.get("name") == "Port Scan":
+                detail = f"{row['ports_scanned']} unique TCP SYN destination ports to one host in {WINDOW_SECONDS}s."
+            elif mode == LIVE_MODE and rule.get("name") == "Traffic Spike":
+                detail = f"{row['traffic_mbps']:.2f} Mbps observed from this source over up to {WINDOW_SECONDS}s."
             alerts.append({
                 "time": row.get("time",""),
                 "src_ip": row.get("src_ip",""),
                 "rule": rule.get("name",""),
                 "type": rule.get("type",""),
                 "severity": rule.get("severity",""),
-                "details": rule.get("desc",""),
+                "details": detail,
                 "ml_anomaly": bool(row.get("is_anomaly", False)),
                 "anomaly_score": float(row.get("anomaly_score", 0.0)) if "anomaly_score" in row else 0.0,
             })
@@ -547,7 +621,7 @@ alerts_df = pd.DataFrame(alerts)
 # KPIs
 # ----------------------------
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total Events (visible)", len(df))
+k1.metric("Sources in capture window" if mode == LIVE_MODE else "Total Events (visible)", len(df))
 k2.metric("Total Alerts", len(alerts_df))
 k3.metric("High Severity", int((alerts_df.get("severity") == "High").sum()) if len(alerts_df) else 0)
 k4.metric("Unique Source IPs", df["src_ip"].nunique() if "src_ip" in df.columns else 0)
@@ -560,7 +634,7 @@ st.divider()
 left, right = st.columns([0.58, 0.42], gap="large")
 
 with left:
-    st.subheader("📥 Incoming Events")
+    st.subheader("Network metrics by source" if mode == LIVE_MODE else "📥 Incoming Events")
     st.dataframe(df, use_container_width=True, height=420)
 
 with right:
@@ -570,7 +644,7 @@ with right:
     else:
         show = alerts_df.copy()
         if "severity" in show.columns:
-            st.dataframe(show.style.applymap(severity_style, subset=["severity"]), use_container_width=True, height=420)
+            st.dataframe(show.style.map(severity_style, subset=["severity"]), use_container_width=True, height=420)
         else:
             st.dataframe(show, use_container_width=True, height=420)
 
@@ -624,6 +698,7 @@ with cA:
         style_chart(fig, ax)
         fig.tight_layout(pad=1.3)
         st.pyplot(fig, clear_figure=True, use_container_width=True)
+        plt.close(fig)
 
 with cB:
     st.caption("Top Source IPs by Alerts")
@@ -643,6 +718,7 @@ with cB:
         style_chart(fig, ax)
         fig.tight_layout(pad=1.3)
         st.pyplot(fig, clear_figure=True, use_container_width=True)
+        plt.close(fig)
 
 with cC:
     st.caption("Anomaly Score · lower scores indicate more unusual records")
@@ -676,6 +752,7 @@ with cC:
         style_chart(fig, ax)
         fig.tight_layout(pad=1.3)
         st.pyplot(fig, clear_figure=True, use_container_width=True)
+        plt.close(fig)
     else:
         st.info("Enable ML to see anomaly score chart.")
 
@@ -685,136 +762,148 @@ st.divider()
 # ----------------------------
 # AI Explanation
 # ----------------------------
-st.subheader("🧠 AI Alert Explanation")
+st.subheader("AI Alert Explanation")
 
-if alerts_df.empty:
-    st.info("No alert selected because there are no alerts.")
+
+@st.cache_resource
+def explanation_worker():
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="netra-ollama")
+
+
+def queue_explanation():
+    option = st.session_state.get("alert_choice")
+    alert = st.session_state.get("explain_options", {}).get(option)
+    if alert:
+        st.session_state.explain_requested = alert
+
+
+def use_alert_ip():
+    option = st.session_state.get("alert_choice")
+    alert = st.session_state.get("explain_options", {}).get(option, {})
+    if is_admin() and is_valid_ip(alert.get("src_ip")):
+        st.session_state.firewall_target = alert["src_ip"]
+
+
+if mode == LIVE_MODE:
+    history = st.session_state.setdefault("live_alert_history", {})
+    for alert in alerts:
+        key = (alert["src_ip"], alert["rule"])
+        history.pop(key, None)
+        history[key] = alert
+    while len(history) > 200:
+        del history[next(iter(history))]
+    explainable = list(reversed(history.values()))
 else:
-    alerts_df = alerts_df.reset_index(drop=True)
-    pick = st.selectbox(
-        "Pick an alert to explain",
-        options=list(range(len(alerts_df))),
-        format_func=lambda i: f"[{alerts_df.loc[i,'severity']}] {alerts_df.loc[i,'src_ip']} → {alerts_df.loc[i,'rule']} @ {alerts_df.loc[i,'time']}",
-    )
-    alert_row = alerts_df.loc[int(pick)].to_dict()
+    explainable = alerts
 
-    st.write(
-        f"**Source IP:** `{alert_row.get('src_ip')}`  |  **Rule:** `{alert_row.get('rule')}`  |  **Severity:** `{alert_row.get('severity')}`"
-    )
+reload_options = st.button("Refresh alert choices", disabled=not explainable)
+if reload_options or st.session_state.get("explain_mode") != mode:
+    st.session_state.pop("explain_options", None)
+    st.session_state.explain_mode = mode
 
-    with st.spinner("Generating explanation..."):
-        exp = explain_alert(alert_row)
+if explainable and not st.session_state.get("explain_options"):
+    options = {}
+    for index, alert in enumerate(explainable):
+        label = f"[{alert['severity']}] {alert['src_ip']} | {alert['rule']}"
+        if mode != LIVE_MODE:
+            label += f" @ {alert['time']} ({index + 1})"
+        options[label] = {**alert, "source": mode}
+    st.session_state.explain_options = options
 
-    if exp.ok:
-        st.markdown(exp.message)  # keep safe: no unsafe_allow_html
-        if getattr(exp, "used_ai", False):
-            st.caption(f"✅ AI used ({getattr(exp, 'model', 'model')})")
+pending = st.session_state.get("pending_explanation")
+if pending and pending[1].done():
+    alert, future = st.session_state.pop("pending_explanation")
+    st.session_state.explanation = alert, future.result()
+    pending = None
+
+if requested := st.session_state.pop("explain_requested", None):
+    if pending is None:
+        pending = requested, explanation_worker().submit(explain_alert, requested)
+        st.session_state.pending_explanation = pending
+
+if options := st.session_state.get("explain_options"):
+    with st.form("explain_alert_form"):
+        st.selectbox("Pick an alert to explain", sorted(options), key="alert_choice")
+        explain_column, response_column = st.columns(2)
+        explain_column.form_submit_button("Explain with Ollama", on_click=queue_explanation, disabled=pending is not None)
+        if is_admin():
+            response_column.form_submit_button("Use source IP in firewall form", on_click=use_alert_ip)
+else:
+    st.info("When a rule triggers, its alert will be available to explain.")
+
+if pending:
+    st.text(f"Generating an explanation for {pending[0]['src_ip']} with local Ollama.")
+
+if stored := st.session_state.get("explanation"):
+    alert, explanation = stored
+    if alert["source"] == mode:
+        st.text(f"{alert['rule']} | {alert['src_ip']} | {alert['time']}")
+        st.text_area("Explanation", value=explanation.message, disabled=True, height=220)
+        if explanation.model:
+            st.caption(f"Local Ollama model: {explanation.model}")
         else:
-            st.caption("ℹ️ Template explanation (set OPENAI_API_KEY for AI)")
-    else:
-        st.error(exp.message)
+            st.info(f"Built-in explanation: {explanation.fallback_reason}")
 
 st.divider()
 
 
-# ----------------------------
-# Response Actions (Firewall)
-# ----------------------------
-st.subheader("🧱 Response Actions (IP Blocking)")
+st.subheader("Response Actions (IP Blocking)")
 
-if "blocked_ips" not in st.session_state:
-    st.session_state.blocked_ips = set()
-
-dry_run = st.sidebar.checkbox("Dry-run firewall (recommended)", value=True)
-allow_real = st.sidebar.checkbox("Enable REAL blocking", value=False, disabled=not is_admin())
-backend = st.sidebar.selectbox("Firewall backend", ["auto", "windows_defender"], index=0)
-
-ip_list = sorted(df["src_ip"].dropna().unique().tolist()) if "src_ip" in df.columns else []
-selected_ip = st.selectbox("Select Source IP", ip_list if ip_list else ["N/A"])
-
-b1, b2, b3 = st.columns([1, 1, 1])
-
-with b1:
-    if st.button("🚫 Block IP", use_container_width=True, disabled=not is_admin()):
-        if not is_valid_ip(selected_ip):
-            st.error("Invalid IP.")
+if is_admin():
+    reason = firewall_status()
+    if reason:
+        st.info(reason)
+    with st.form("firewall_response"):
+        target = st.text_input("Remote IPv4 or IPv6 address", key="firewall_target").strip()
+        if reason is None:
+            action_mode = st.radio("Action mode", ["Preview", "Apply to Windows Firewall"], horizontal=True)
         else:
-            # CSRF check (report + safety)
-            if not require_csrf(csrf_token):
-                st.error("CSRF check failed.")
+            action_mode = "Preview"
+        block_column, unblock_column = st.columns(2)
+        block_requested = block_column.form_submit_button("Block IP", use_container_width=True)
+        unblock_requested = unblock_column.form_submit_button("Unblock IP", use_container_width=True)
+
+    if block_requested or unblock_requested:
+        if not is_admin() or not require_csrf(csrf_token):
+            st.error("An active admin session is required.")
+        else:
+            apply = action_mode == "Apply to Windows Firewall"
+            action = block_ip if block_requested else unblock_ip
+            st.session_state.firewall_action = action(target, apply=apply)
+            if apply:
+                st.session_state.firewall_inventory = list_ids_rules()
+
+    if result := st.session_state.get("firewall_action"):
+        (st.info if result.ok else st.error)(result.message)
+
+    if st.button("Read Windows Firewall rules"):
+        st.session_state.firewall_inventory = list_ids_rules()
+    if inventory := st.session_state.get("firewall_inventory"):
+        if inventory.ok:
+            st.caption(inventory.message)
+            if inventory.rules:
+                st.dataframe(list(inventory.rules), hide_index=True, use_container_width=True)
             else:
-                res = block_ip(selected_ip, allow_real=allow_real, dry_run=dry_run, backend=backend)
-                if res.ok:
-                    st.session_state.blocked_ips.add(selected_ip)
-                    st.success(res.message)
-                else:
-                    st.error(res.message)
-                if res.command:
-                    st.code(res.command)
-
-with b2:
-    if st.button("✅ Unblock IP", use_container_width=True, disabled=not is_admin()):
-        if not is_valid_ip(selected_ip):
-            st.error("Invalid IP.")
+                st.caption("No Netra rules in active Windows policy.")
         else:
-            if not require_csrf(csrf_token):
-                st.error("CSRF check failed.")
-            else:
-                res = unblock_ip(selected_ip, allow_real=allow_real, dry_run=dry_run, backend=backend)
-                if res.ok:
-                    st.session_state.blocked_ips.discard(selected_ip)
-                    st.success(res.message)
-                else:
-                    st.error(res.message)
-                if res.command:
-                    st.code(res.command)
-
-with b3:
-    if st.button("📜 Show IDS Firewall Rules", use_container_width=True):
-        res = list_ids_rules()
-        if res.ok:
-            st.code(res.message)
-        else:
-            st.error(res.message)
-
-st.caption(
-    "Blocked IPs (session): "
-    + (", ".join(sorted(st.session_state.blocked_ips)) if st.session_state.blocked_ips else "None")
-)
-
-if not is_admin():
-    st.warning("Viewer role: blocking disabled.")
-
-with st.expander("📘 How this IDS works (for lab viva)"):
-    st.markdown(
-        """
-**Flow**
-1) Data Source → Demo events or CSV live stream  
-2) Detection → Rules apply on each row (SAFE AST evaluator)  
-3) ML Layer → Isolation Forest highlights anomalies  
-4) Alerts → severity + rule + source IP  
-5) Response → Admin can block/unblock (Dry-run by default)
-
-**Security Controls**
-- RBAC: admin-only response actions  
-- Session security: login required  
-- Safe rule evaluation: no raw eval  
-- IP validation before firewall calls  
-- CSRF token check for sensitive actions  
-- Charts use Matplotlib (no Altair dependency)
-"""
-    )
+            st.error(inventory.message)
+else:
+    st.info("An admin session is required to manage firewall rules.")
 
 
-# ----------------------------
-# Timer-based auto refresh (ONLY when running)
-# ----------------------------
-render_header()
+def refresh_feed(interval, feed_active):
+    @st.fragment(run_every=interval)
+    def refresh_timer():
+        if time.monotonic() - st.session_state.rendered_feed_at >= interval * 0.9:
+            if feed_active:
+                st.session_state.feed_tick = mode
+            st.rerun()
 
-if refresh and refresh > 0 and st.session_state.live_running:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=refresh * 1000, key="ids_autorefresh")
-    except Exception:
-        time.sleep(refresh)
-        st.rerun()
+    st.session_state.rendered_feed_at = time.monotonic()
+    refresh_timer()
+
+
+feed_active = bool(refresh and ((mode == LIVE_MODE and capture and capture.active)
+                               or (mode != LIVE_MODE and st.session_state.live_running)))
+if feed_active or pending:
+    refresh_feed(refresh if feed_active else 1, feed_active)

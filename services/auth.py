@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import streamlit as st
-from config import SESSION_TTL_SECONDS, SESSION_ROTATE_ON_LOGIN
+from config import ADMIN_PASSWORD_CONFIGURED, SESSION_TTL_SECONDS, SESSION_ROTATE_ON_LOGIN
 from utils.security import now_ts, new_csrf_token, verify_password, hash_password
 
 AUTH_KEY = "ids_auth_v2"
@@ -12,11 +12,11 @@ CSRF_KEY = "ids_csrf_v1"
 # Demo users:
 # In prod: store hashes in env vars or secured storage (not in code).
 # You can generate hash once:
-#   python -c "from utils.security import hash_password; print(hash_password('admin123'))"
+#   python -c "from getpass import getpass; from utils.security import hash_password; print(hash_password(getpass()))"
 USERS = {
     "admin": {
         "role": "admin",
-        "password_hash": os.getenv("IDS_ADMIN_HASH") or hash_password("admin123"),
+        "password_hash": os.getenv("IDS_ADMIN_HASH").strip() if ADMIN_PASSWORD_CONFIGURED else hash_password("admin123"),
     },
     "viewer": {
         "role": "viewer",
@@ -30,6 +30,15 @@ def _expired(auth: dict) -> bool:
     exp = auth.get("expires_at", 0)
     return now_ts() > int(exp)
 
+def _end_session():
+    capture = st.session_state.get("capture")
+    if capture:
+        capture.stop()
+    if pending := st.session_state.get("pending_explanation"):
+        pending[1].cancel()
+    st.session_state.clear()
+
+
 def require_login():
     """Require authentication and show a centered login page when signed out."""
     if AUTH_KEY not in st.session_state:
@@ -40,7 +49,7 @@ def require_login():
         return auth
 
     if auth and _expired(auth):
-        st.session_state[AUTH_KEY] = None
+        _end_session()
         st.warning("Your session has expired. Please sign in again.")
 
     # Branded header; the unused sidebar is hidden by the login-specific CSS.
@@ -95,12 +104,12 @@ def logout_button():
     if auth and not _expired(auth):
         st.sidebar.caption(f"Logged in as: **{auth.get('username')}** ({auth.get('role')})")
         if st.sidebar.button("Logout", use_container_width=True):
-            st.session_state[AUTH_KEY] = None
+            _end_session()
             st.rerun()
 
 def is_admin() -> bool:
     auth = st.session_state.get(AUTH_KEY) or {}
-    return auth.get("role") == "admin"
+    return auth.get("role") == "admin" and not _expired(auth)
 
 def get_csrf_token() -> str:
     if CSRF_KEY not in st.session_state:

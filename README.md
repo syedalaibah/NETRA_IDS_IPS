@@ -76,18 +76,8 @@ pip install -r requirements.txt
 # Run the application
 python app.py
 
----
 
-## 👨‍💻 Development Team
 
-| GitHub | LinkedIn | Developer Name |
-|:------:|:--------:|----------------|
-| [<img src="./assets/github.png" width="18"/>](https://github.com/Qmma52) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/mustafa-ali-7b2a34338/) | **Qazi Muhammad Mustafa Ali** |
-| [<img src="./assets/github.png" width="18"/>](https://github.com/haider14-9abbaas) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/syed-haider-abbas-zaidi-132525215/) | **Syed Haider Abbas Zaidi** |
-| [<img src="./assets/github.png" width="18"/>](https://github.com/sufyan123ayaz) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/sufyan-ayaz-34039a339/) | **Muhammad Sufyan Ayaz** |
-| [<img src="./assets/github.png" width="18"/>](https://github.com/Hamza-hani) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/hamza-kamran-271872297/) | **Muhammad Hamza Kamran** |
-| [<img src="./assets/github.png" width="18"/>](https://github.com/basitkk48) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/abdul-basit-kk-554012309/) | **Abdul Basit** |
-| [<img src="./assets/github.png" width="18"/>](https://github.com/CyberChase007) | [<img src="./assets/linkedin.png" width="18"/>](https://www.linkedin.com/in/ahmed-farzan/) | **Ahmed Farzan** |
 
 
 🔮 Future Enhancements

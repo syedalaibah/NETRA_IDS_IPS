@@ -2,7 +2,9 @@
 venv/
 pkgs/
 __pycache__/
-*/__pycache__/
+**/__pycache__/
 *.py[cod]
 .env
 .streamlit/secrets.toml
+.vscode/
+IPS-IDS-main/
